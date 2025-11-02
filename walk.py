@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-# HW3 - Stage Hospital Walker
-# - Subscribes:  /robot_0/base_scan   (LaserScan)
-#                /robot_0/odom        (Odometry)   # dùng để tính tổng quãng đường
-# - Publishes:   /robot_0/cmd_vel     (Twist)
-# - Runs 300 seconds then stops and prints total distance traveled.
 
 import math
 import numpy as np
@@ -23,11 +17,11 @@ class Walker(Node):
         self.cmd_pub = self.create_publisher(Twist, '/robot_0/cmd_vel', 10)
         self.scan_sub = self.create_subscription(LaserScan, '/robot_0/base_scan', self.scan_cb, 10)
 
-        # Nếu prof yêu cầu "ground truth", bạn có thể đổi topic ODOM ở đây.
+        
         self.odom_sub = self.create_subscription(Odometry, '/robot_0/odom', self.odom_cb, 10)
         # self.odom_sub = self.create_subscription(Odometry, '/robot_0/base_pose_ground_truth', self.odom_cb, 10)
 
-        # --- Behavior params (tune nhẹ theo hành lang hẹp) ---
+        # --- Behavior params
         self.safe_front = 0.8     # m: an toàn phía trước
         self.safe_side  = 0.6     # m: an toàn bên hông
         self.v_fwd      = 0.4     # m/s
