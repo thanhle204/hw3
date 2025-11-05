@@ -1,163 +1,252 @@
-
-import math
-import numpy as np
-
+#!/usr/bin/env python3
+import math, random, numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 
+def euclid(ax, ay, bx, by): return math.hypot(ax - bx, ay - by)
 
 class Walker(Node):
     def __init__(self):
         super().__init__('walker_hw3')
 
-        # --- Topics (Stage with enforce_prefixes:=false) ---
-        self.cmd_pub = self.create_publisher(Twist, '/robot_0/cmd_vel', 10)
-        self.scan_sub = self.create_subscription(LaserScan, '/robot_0/base_scan', self.scan_cb, 10)
+        # --- IO
+        self.pub  = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.subL = self.create_subscription(LaserScan, '/base_scan', self.scan_cb, 10)
+        self.subO = self.create_subscription(Odometry,  '/odom',      self.odom_cb, 10)
 
-        
-        self.odom_sub = self.create_subscription(Odometry, '/robot_0/odom', self.odom_cb, 10)
-        # self.odom_sub = self.create_subscription(Odometry, '/robot_0/base_pose_ground_truth', self.odom_cb, 10)
+        # --- Hospital-friendly thresholds
+        self.front_block = 0.42      # enter SPIN if front < this
+        self.front_clear = 0.50      # exit SPIN if front >= this (hysteresis)
+        self.side_hug    = 0.33      # if side < this and front clear -> creep & steer away
+        self.emerg       = 0.16      # true emergency stop
 
-        # --- Behavior params
-        self.safe_front = 0.8     # m: an toàn phía trước
-        self.safe_side  = 0.6     # m: an toàn bên hông
-        self.v_fwd      = 0.4     # m/s
-        self.w_turn     = 0.9     # rad/s
+        # --- Random-wander gating (when space is open)
+        self.open_front = 0.80       # consider “open” if front >= this
+        self.open_side  = 0.55       # and both sides >= this
 
-        # --- Scan state ---
-        self.min_front = None
-        self.min_left  = None
-        self.min_right = None
+        # --- Speeds
+        self.v_fwd   = 0.20
+        self.v_creep = 0.08
+        self.v_back  = -0.09
+        self.w_spin  = 0.75
+        self.w_steer = 0.55          # gentle steer when hugging
+        self.w_wander = 0.35         # mild wander turn when space is open
 
-        # --- Odom / distance tracking ---
-        self.start_pos = None
-        self.last_pos  = None
-        self.total_dist = 0.0
+        # --- Short backup caps (only a little!)
+        self.back_dist_max = 0.14
+        self.rear_emerg = 0.18
+        self.rear_safe  = 0.32
 
-        # --- Run time ---
+        # --- Stuck logic
+        self.idle_secs_to_spin = 2.0
+        self.spin_no_improve_to_backup = 2.0
+
+        # --- 300s cap
         self.start_time = self.get_clock().now()
-        self.max_seconds = 300.0  # 5 minutes
+        self.max_seconds = 300.0
 
-        # --- Stuck detection ---
+        # --- State (scan/odom)
+        self.f = self.l = self.r = float('inf')
+        self.rear = float('inf'); self.has_rear = False
+        self.x = self.y = 0.0
+        self.start_xy = None
+        self.max_disp = 0.0
         self.last_move_time = self.get_clock().now()
-        self.escape_until = None  # rclpy Time until which we keep escaping
 
-        # Control loop at 10 Hz
+        # --- Modes: NORMAL | SPIN | BACKUP
+        self.mode = 'NORMAL'
+        self.spin_dir = +1.0
+        self.best_front_seen = 0.0
+        self.last_improve_time = None
+        self.back_start_xy = None
+
+        # --- Wander state (when open, keep a random slight heading for a short time)
+        self.wander_until = None
+        self.wander_wz = 0.0
+
+        # --- Timers
         self.timer = self.create_timer(0.1, self.step)
+        self.print_timer = self.create_timer(1.0, self.print_stats)  # print displacement once per sec
 
-        self.get_logger().info('Walker HW3 started.')
+        self.get_logger().info('HW3 walker running (random-wander + displacement reporting).')
 
-    # ---------- Callbacks ----------
-
+    # ---------------- Callbacks ----------------
     def scan_cb(self, msg: LaserScan):
-        """Compute min distances in front / left / right sectors."""
         n = len(msg.ranges)
-        if n == 0:
-            self.min_front = self.min_left = self.min_right = None
-            return
+        if n == 0: return
+        ang = np.linspace(msg.angle_min, msg.angle_max, n)
+        rng = np.array(msg.ranges, dtype=float)
+        rng[(~np.isfinite(rng)) | (rng <= 0.0)] = np.inf
 
-        angles = np.linspace(msg.angle_min, msg.angle_max, n)
-        ranges = np.array(msg.ranges, dtype=float)
-        ranges[~np.isfinite(ranges)] = np.inf  # replace NaN/inf
+        def pct(a0,a1):
+            m = (ang >= a0) & (ang <= a1)
+            v = rng[m]
+            return float(np.percentile(v, 20)) if v.size else float('inf')
 
-        # sectors (radians)
-        front_mask = (angles > -0.35) & (angles < 0.35)         # ~±20°
-        left_mask  = (angles >= 0.35) & (angles < 1.2)          # 20°..~70°
-        right_mask = (angles > -1.2) & (angles <= -0.35)        # -70°..-20°
+        self.f = pct(-0.30, 0.30)      # front ~±17°
+        self.l = pct( 0.45, 1.20)      # left
+        self.r = pct(-1.20,-0.45)      # right
 
-        def mins(mask):
-            if not mask.any():
-                return None
-            m = np.min(ranges[mask])
-            return float(m) if np.isfinite(m) else None
-
-        self.min_front = mins(front_mask)
-        self.min_left  = mins(left_mask)
-        self.min_right = mins(right_mask)
+        # Rear rays if lidar covers behind
+        rear_mask = (ang <= -2.5) | (ang >= 2.5)
+        rear_vals = rng[rear_mask]
+        self.has_rear = rear_vals.size > 0
+        self.rear = float(np.percentile(rear_vals, 20)) if self.has_rear else float('inf')
 
     def odom_cb(self, msg: Odometry):
-        x = msg.pose.pose.position.x
-        y = msg.pose.pose.position.y
-
-        if self.start_pos is None:
-            self.start_pos = (x, y)
-            self.last_pos  = (x, y)
+        x = msg.pose.pose.position.x; y = msg.pose.pose.position.y
+        if self.start_xy is None:
+            self.start_xy = (x, y)
+        # progress detection
+        if euclid(x, y, self.x, self.y) > 0.003:
             self.last_move_time = self.get_clock().now()
-            return
+        self.x, self.y = x, y
+        # displacement from start (furthest point)
+        d = euclid(self.x, self.y, *self.start_xy)
+        if d > self.max_disp:
+            self.max_disp = d
 
-        step = math.hypot(x - self.last_pos[0], y - self.last_pos[1])
-        self.total_dist += step
-        self.last_pos = (x, y)
-
-        # if moved enough, refresh last_move_time
-        if step > 0.003:
-            self.last_move_time = self.get_clock().now()
-
-    # ---------- Control step ----------
-
+    # ---------------- Control ----------------
     def step(self):
-        # Stop after 300s
+        # End after 300 sec
         now = self.get_clock().now()
         elapsed = (now - self.start_time).nanoseconds * 1e-9
-        if elapsed >= self.max_seconds:
+        if elapsed > self.max_seconds:
             self._stop_and_exit(elapsed)
             return
 
-        # If escaping from stuck, keep turning until escape_until
-        if self.escape_until is not None and now < self.escape_until:
-            self._publish(0.0, self.w_turn)  # keep turning left
-            return
+        # Emergency stop
+        if min(self.f, self.l, self.r) < self.emerg:
+            return self.cmd(0.0, 0.0)
+
+        # BACKUP: short, capped, rear-aware
+        if self.mode == 'BACKUP':
+            if self.has_rear and self.rear < self.rear_emerg:
+                self.mode = 'SPIN'
+                self._spin_reset(now)
+                return self.cmd(0.0, self.spin_dir * self.w_spin)
+
+            if self.back_start_xy is None:
+                self.back_start_xy = (self.x, self.y)
+            moved = euclid(self.x, self.y, *self.back_start_xy)
+
+            target = self.back_dist_max
+            if self.has_rear and self.rear < self.rear_safe:
+                target = max(0.08, 0.5 * self.back_dist_max)
+
+            if moved < target:
+                return self.cmd(self.v_back, 0.0)
+
+            self.mode = 'SPIN'
+            self._spin_reset(now)
+            return self.cmd(0.0, self.spin_dir * self.w_spin)
+
+        # SPIN: rotate in place until front clears; if not improving, short backup then continue
+        if self.mode == 'SPIN':
+            if self.f >= self.front_clear:
+                self.mode = 'NORMAL'
+                self._maybe_start_wander(now)  # pick a wander heading immediately after finding an opening
+                return self.cmd(self.v_fwd, self.wander_wz)
+
+            if (self.last_improve_time is None) or (self.f > self.best_front_seen + 0.02):
+                self.best_front_seen = self.f
+                self.last_improve_time = now
+
+            if self.last_improve_time and (now - self.last_improve_time).nanoseconds * 1e-9 > self.spin_no_improve_to_backup:
+                self.mode = 'BACKUP'
+                self.back_start_xy = (self.x, self.y)
+                return self.cmd(self.v_back, 0.0)
+
+            return self.cmd(0.0, self.spin_dir * self.w_spin)
+
+        # NORMAL:
+        # 1) Front blocked → enter SPIN (choose initial direction toward more open side)
+        if self.f < self.front_block:
+            self.mode = 'SPIN'
+            self._spin_reset(now)
+            self.spin_dir = +1.0 if self.l > self.r else -1.0
+            return self.cmd(0.0, self.spin_dir * self.w_spin)
+
+        # 2) Side-hug: front clear but one side too close → creep and steer away (keep moving!)
+        if self.l < self.side_hug and self.r >= self.l + 0.02:
+            self._cancel_wander()
+            return self.cmd(self.v_creep, -self.w_steer)
+        if self.r < self.side_hug and self.l >= self.r + 0.02:
+            self._cancel_wander()
+            return self.cmd(self.v_creep,  self.w_steer)
+
+        # 3) Open-space wander: when front and both sides are open, keep a random mild heading for a short time
+        if self._space_open():
+            if self.wander_until is None or now >= self.wander_until:
+                self._pick_wander(now)
+            return self.cmd(self.v_fwd, self.wander_wz)
+
+        # 4) Otherwise: go straight
+        self._cancel_wander()
+        return self.cmd(self.v_fwd, 0.0)
+
+    # ------------- Wander helpers -------------
+    def _space_open(self):
+        return (self.f >= self.open_front) and (self.l >= self.open_side) and (self.r >= self.open_side)
+
+    def _pick_wander(self, now):
+        # choices: straight (50%), slight left (25%), slight right (25%)
+        choice = random.random()
+        if choice < 0.5:
+            self.wander_wz = 0.0
+        elif choice < 0.75:
+            self.wander_wz = +self.w_wander
         else:
-            self.escape_until = None
+            self.wander_wz = -self.w_wander
+        dur = random.uniform(1.2, 2.5)  # seconds to keep this heading
+        self.wander_until = now + Duration(seconds=dur)
 
-        # Very simple obstacle avoidance
-        f = self.min_front if self.min_front is not None else np.inf
-        l = self.min_left  if self.min_left  is not None else np.inf
-        r = self.min_right if self.min_right is not None else np.inf
-
-        if f < self.safe_front:
-            # Turn toward the side with more clearance
-            if l > r:
-                self._publish(0.0, +self.w_turn)
-            else:
-                self._publish(0.0, -self.w_turn)
-        elif l < self.safe_side:
-            self._publish(0.1, -self.w_turn)  # steer right a bit
-        elif r < self.safe_side:
-            self._publish(0.1, +self.w_turn)  # steer left a bit
+    def _maybe_start_wander(self, now):
+        if self._space_open():
+            self._pick_wander(now)
         else:
-            self._publish(self.v_fwd, 0.0)
+            self._cancel_wander()
 
-        # Stuck detection: if no movement for ~2.5s, rotate to escape for 1.2s
-        idle_sec = (now - self.last_move_time).nanoseconds * 1e-9
-        if idle_sec > 2.5:
-            self.escape_until = now + rclpy.time.Duration(seconds=1.2)
-            self._publish(0.0, self.w_turn)
+    def _cancel_wander(self):
+        self.wander_until = None
+        self.wander_wz = 0.0
 
-    # ---------- Helpers ----------
+    # ------------- Spin helpers -------------
+    def _spin_reset(self, now):
+        self.best_front_seen = self.f
+        self.last_improve_time = now
 
-    def _publish(self, vx, wz):
-        t = Twist()
-        t.linear.x = float(vx)
-        t.angular.z = float(wz)
-        self.cmd_pub.publish(t)
+    # ------------- Output & shutdown -------------
+    def cmd(self, vx, wz):
+        # odom-based idle watchdog: if not moving for a while AND front is clear, nudge forward
+        now = self.get_clock().now()
+        idle = (now - self.last_move_time).nanoseconds * 1e-9
+        if self.mode == 'NORMAL' and idle > self.idle_secs_to_spin and self.f >= self.front_clear:
+            vx = self.v_creep
+            # small steer away from the closer side when nudging
+            wz = -self.w_steer if self.l < self.r else self.w_steer
+
+        msg = Twist()
+        msg.linear.x = float(vx)
+        msg.angular.z = float(wz)
+        self.pub.publish(msg)
 
     def _stop_and_exit(self, elapsed):
-        self._publish(0.0, 0.0)
-        self.get_logger().info(
-            f'Run finished: {elapsed:.1f}s | distance ≈ {self.total_dist:.2f} m'
-        )
+        self.cmd(0.0, 0.0)
+        self.get_logger().info(f'[HW3] Time: {elapsed:.1f}s | Max displacement: {self.max_disp:.2f} m (goal ≥ 10.0 m)')
         rclpy.shutdown()
 
+    def print_stats(self):
+        # Prints once per second so you can watch progress in terminal
+        self.get_logger().info(f'Displacement: {self.max_disp:.2f} m | Front/L/R: {self.f:.2f}/{self.l:.2f}/{self.r:.2f}')
 
 def main():
     rclpy.init()
-    node = Walker()
-    rclpy.spin(node)
-
+    rclpy.spin(Walker())
 
 if __name__ == '__main__':
     main()
